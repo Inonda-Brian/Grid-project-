@@ -5,6 +5,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 
 using namespace std;
 
@@ -20,7 +21,9 @@ enum class FaultType {
     OVERVOLTAGE,
     TRANSFORMER_OVERHEAT,
     PHASE_IMBALANCE,
-    SHORT_CIRCUIT
+    SHORT_CIRCUIT,
+    FREQUENCY_DEVIATION,
+    LOW_POWER_FACTOR
 };
 
 // ------------------------------------------------------------
@@ -64,6 +67,111 @@ public:
     }
 };
 
+// ============================================================
+// FREQUENCY MONITOR
+// ============================================================
+class FrequencyMonitor {
+private:
+    double nominalFrequency;  // 50 or 60 Hz
+    double currentFrequency;
+    double frequencyThresholdHigh;  // Hz above nominal
+    double frequencyThresholdLow;   // Hz below nominal
+
+public:
+    FrequencyMonitor(double nominal = 60.0)
+        : nominalFrequency(nominal),
+          currentFrequency(nominal),
+          frequencyThresholdHigh(62.0),
+          frequencyThresholdLow(58.0) {}
+
+    void updateFrequency(double load, double generation) {
+        // Frequency changes based on balance between generation and load
+        // Excess generation -> frequency rises
+        // Excess load -> frequency falls
+        
+        double imbalance = generation - load;  // MW difference
+        double frequencyDeviation = imbalance * 0.5;  // 0.5 Hz per MW imbalance
+        
+        currentFrequency = nominalFrequency + frequencyDeviation;
+        
+        // Damping - frequency returns toward nominal
+        currentFrequency = currentFrequency * 0.9 + nominalFrequency * 0.1;
+    }
+
+    double getCurrentFrequency() const {
+        return currentFrequency;
+    }
+
+    double getFrequencyDeviation() const {
+        return abs(currentFrequency - nominalFrequency);
+    }
+
+    bool isFrequencyHealthy() const {
+        return currentFrequency >= frequencyThresholdLow &&
+               currentFrequency <= frequencyThresholdHigh;
+    }
+
+    string getFrequencyStatus() const {
+        if (currentFrequency < frequencyThresholdLow) {
+            return "LOW FREQUENCY - Load Shedding Needed";
+        } else if (currentFrequency > frequencyThresholdHigh) {
+            return "HIGH FREQUENCY - Excess Generation";
+        } else {
+            return "FREQUENCY NORMAL";
+        }
+    }
+};
+
+// ============================================================
+// POWER FACTOR MONITOR
+// ============================================================
+class PowerFactorMonitor {
+private:
+    double powerFactor;           // 0.0 to 1.0
+    double powerFactorThreshold;  // Typically 0.85
+    double reactiveLoad;          // kVAR
+
+public:
+    PowerFactorMonitor()
+        : powerFactor(0.95),
+          powerFactorThreshold(0.85),
+          reactiveLoad(0.0) {}
+
+    void updatePowerFactor(double voltage, double current, double phaseAngle) {
+        // Power factor = cos(phase angle)
+        // Phase angle represents phase shift between voltage and current
+        powerFactor = cos(phaseAngle * M_PI / 180.0);
+        
+        // Clamp to valid range
+        powerFactor = max(0.0, min(1.0, powerFactor));
+        
+        // Calculate reactive power (VAR = V * I * sin(angle))
+        reactiveLoad = voltage * current * sin(phaseAngle * M_PI / 180.0);
+    }
+
+    double getPowerFactor() const {
+        return powerFactor;
+    }
+
+    double getReactivePower() const {
+        return reactiveLoad;
+    }
+
+    bool isPowerFactorHealthy() const {
+        return powerFactor >= powerFactorThreshold;
+    }
+
+    string getPowerFactorStatus() const {
+        if (powerFactor < powerFactorThreshold) {
+            return "LOW POWER FACTOR - Reactive Compensation Needed";
+        } else if (powerFactor > 0.95) {
+            return "EXCELLENT POWER FACTOR";
+        } else {
+            return "POWER FACTOR ACCEPTABLE";
+        }
+    }
+};
+
 // ------------------------------------------------------------
 // Fault Detector
 // ------------------------------------------------------------
@@ -76,7 +184,9 @@ public:
         double temperature,
         double phaseA,
         double phaseB,
-        double phaseC
+        double phaseC,
+        double frequency,
+        double powerFactor
     ) {
 
         // Short circuit
@@ -106,6 +216,14 @@ public:
         if ((maxPhase - minPhase) > 20.0)
             return FaultType::PHASE_IMBALANCE;
 
+        // Frequency deviation (severe)
+        if (frequency < 58.0 || frequency > 62.0)
+            return FaultType::FREQUENCY_DEVIATION;
+
+        // Low power factor
+        if (powerFactor < 0.80)
+            return FaultType::LOW_POWER_FACTOR;
+
         return FaultType::NONE;
     }
 
@@ -130,6 +248,12 @@ public:
 
             case FaultType::SHORT_CIRCUIT:
                 return "SHORT CIRCUIT";
+
+            case FaultType::FREQUENCY_DEVIATION:
+                return "FREQUENCY DEVIATION";
+
+            case FaultType::LOW_POWER_FACTOR:
+                return "LOW POWER FACTOR";
 
             default:
                 return "NORMAL";
@@ -169,6 +293,39 @@ public:
     }
 };
 
+// ============================================================
+// LOAD SHEDDING CONTROLLER
+// ============================================================
+class LoadSheddingController {
+private:
+    double totalLoad;
+    bool isActive;
+
+public:
+    LoadSheddingController() : totalLoad(100.0), isActive(false) {}
+
+    void activateLoadShedding(double frequencyDeviation) {
+        // Shed 5% of load for every 0.5 Hz below nominal
+        if (frequencyDeviation > 1.5) {
+            totalLoad *= 0.90;  // Reduce by 10%
+            isActive = true;
+        }
+    }
+
+    void deactivateLoadShedding() {
+        totalLoad = 100.0;
+        isActive = false;
+    }
+
+    double getTotalLoad() const {
+        return totalLoad;
+    }
+
+    bool isLoadSheddingActive() const {
+        return isActive;
+    }
+};
+
 // ------------------------------------------------------------
 // Grid Simulator
 // ------------------------------------------------------------
@@ -179,11 +336,15 @@ private:
     Transformer transformer;
     FaultDetector detector;
     ProtectionRelay relay;
+    FrequencyMonitor freqMonitor;
+    PowerFactorMonitor pfMonitor;
+    LoadSheddingController loadShedding;
 
     mt19937 generator;
 
     uniform_real_distribution<double> voltageNoise;
     uniform_real_distribution<double> currentNoise;
+    uniform_real_distribution<double> phaseAngleNoise;
 
 public:
 
@@ -191,17 +352,22 @@ public:
         : transformer(11.0, 100.0),
           generator(random_device{}()),
           voltageNoise(-0.2, 0.2),
-          currentNoise(-10.0, 10.0) {}
+          currentNoise(-10.0, 10.0),
+          phaseAngleNoise(-5.0, 5.0) {}
 
     void run(int simulationTime) {
 
         cout << "\n";
         cout << "============================================\n";
-        cout << "              GRIDGUARD\n";
+        cout << "              GRIDGUARD v2.0\n";
         cout << " Intelligent Electrical Grid Protection\n";
+        cout << "  With Frequency & Power Factor Monitoring\n";
         cout << "============================================\n";
 
         cout << "\nStarting simulation...\n\n";
+
+        double generation = 90.0;  // MW
+        double load = 85.0;         // MW
 
         for (int t = 1; t <= simulationTime; ++t) {
 
@@ -230,6 +396,8 @@ public:
             double phaseC =
                 100.0 + currentNoise(generator) * 0.2;
 
+            double phaseAngle = 20.0 + phaseAngleNoise(generator);
+
             // ------------------------------------------------
             // Introduce artificial faults
             // ------------------------------------------------
@@ -252,15 +420,38 @@ public:
                 phaseC = 100.0;
             }
 
+            // Frequency fault: Loss of generation at t=28
+            if (t == 28) {
+                generation = 50.0;  // Major generation loss
+            }
+
+            // Power factor fault: Inductive load at t=32
+            if (t == 32) {
+                phaseAngle = 45.0;  // Low PF
+            }
+
             if (t == 25) {
                 current = 600.0;
             }
 
-            // Update transformer temperature
-            transformer.updateTemperature(current);
+            // ------------------------------------------------
+            // Update grid parameters
+            // ------------------------------------------------
 
-            double temperature =
-                transformer.getTemperature();
+            transformer.updateTemperature(current);
+            freqMonitor.updateFrequency(loadShedding.getTotalLoad(), generation);
+            pfMonitor.updatePowerFactor(voltage, current, phaseAngle);
+
+            // Load shedding if frequency critical
+            if (!freqMonitor.isFrequencyHealthy()) {
+                loadShedding.activateLoadShedding(freqMonitor.getFrequencyDeviation());
+            } else {
+                loadShedding.deactivateLoadShedding();
+            }
+
+            double temperature = transformer.getTemperature();
+            double frequency = freqMonitor.getCurrentFrequency();
+            double powerFactor = pfMonitor.getPowerFactor();
 
             // Detect fault
             FaultType fault =
@@ -270,7 +461,9 @@ public:
                     temperature,
                     phaseA,
                     phaseB,
-                    phaseC
+                    phaseC,
+                    frequency,
+                    powerFactor
                 );
 
             // ------------------------------------------------
@@ -301,6 +494,25 @@ public:
 
             cout << "Phase C:        "
                  << phaseC << " A\n";
+
+            // ------------------------------------------------
+            // Display NEW parameters
+            // ------------------------------------------------
+
+            cout << "\nFrequency:      "
+                 << frequency << " Hz";
+            cout << " (" << freqMonitor.getFrequencyDeviation() << " Hz deviation)\n";
+
+            cout << "Power Factor:   " << setprecision(3)
+                 << powerFactor << "\n";
+
+            cout << "Reactive Power: " << setprecision(2)
+                 << pfMonitor.getReactivePower() << " kVAR\n";
+
+            if (loadShedding.isLoadSheddingActive()) {
+                cout << "Load Shedding:  ACTIVE - Load: "
+                     << loadShedding.getTotalLoad() << " MW\n";
+            }
 
             // ------------------------------------------------
             // Protection decision
@@ -349,7 +561,7 @@ int main() {
 
     GridSimulator grid;
 
-    grid.run(30);
+    grid.run(35);
 
     return 0;
 }
